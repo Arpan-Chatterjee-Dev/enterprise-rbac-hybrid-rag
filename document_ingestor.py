@@ -90,7 +90,7 @@ class DocumentIngestor:
                               vectors_config=VectorParams(distance=Distance.COSINE,size=len(self.dense_embedder.embed_query("test"))))
    for field in ["collection","matter_id","access_roles"]:
     self.client.create_payload_index(collection_name=self.collection_name,field_name=field,field_schema="keyword")
-   ids=vector_store.add_documents(customized_chunk_texts)
+   ids=self.vector_store.add_documents(customized_chunk_texts)
    print(f"Upsert Done {len(ids)}")
 
   def hybrid_search(self,user_name:str,seach_query:str):
