@@ -32,14 +32,14 @@ class DocumentIngestor:
   def __init__(self):
    self.EMBED_MODEL="sentence-transformers/all-MiniLM-L6-v2"
    self.collection_name="veridian_legal"
-   self.SPARSE_VECTOR_NAME="veridion_legal_sparse"
+   self.SPARSE_VECTOR_NAME="veridian_legal_sparse"
    self.DOC_PATH="./veridian_legal_dataset/"
    self.client=QdrantClient(path="/local/vectorDb")
    self.dense_embedder=HuggingFaceEmbeddings(model_name = self.EMBED_MODEL,
              model_kwargs = {"device": "cuda"},
              encode_kwargs = {"normalize_embeddings": True})
    self.sparse_embedder=FastEmbedSparse(model_name="Qdrant/bm25",batch_size=32)
-   self.vector_store:QdrantVectorStore=QdrantVectorStore(client=self.client,collection_name=self.collection_name,embedding=self.dense_embedder,metadata_payload_key=None,
+   self.vector_store:QdrantVectorStore=QdrantVectorStore(client=self.client,collection_name=self.collection_name,embedding=self.dense_embedder,
                                         sparse_embedding=self.sparse_embedder,retrieval_mode=RetrievalMode.HYBRID,sparse_vector_name=self.SPARSE_VECTOR_NAME)
          
       
@@ -88,7 +88,7 @@ class DocumentIngestor:
     self.client.create_collection(collection_name=self.collection_name,
                               sparse_vectors_config={self.SPARSE_VECTOR_NAME:SparseVectorParams(modifier=Modifier.IDF)},
                               vectors_config=VectorParams(distance=Distance.COSINE,size=len(self.dense_embedder.embed_query("test"))))
-   for field in ["collection","matter_id","access_roles"]:
+   for field in ["metadata.collection","metadata.matter_id","metadata.access_roles"]:
     self.client.create_payload_index(collection_name=self.collection_name,field_name=field,field_schema="keyword")
    ids=self.vector_store.add_documents(customized_chunk_texts)
    print(f"Upsert Done {len(ids)}")
@@ -101,7 +101,7 @@ class DocumentIngestor:
         current_user_matter=item["matters"]
         conditions = [
             FieldCondition(
-                key="access_roles",
+                key="metadata.access_roles",
                 match=MatchAny(any=current_user_roles)
             )
         ]
@@ -109,7 +109,7 @@ class DocumentIngestor:
         if "*" not in current_user_matter:
             conditions.append(
                 FieldCondition(
-                    key="matter_id",
+                    key="metadata.matter_id",
                     match=MatchAny(any=["NONE", *current_user_matter])
                 )
             )
