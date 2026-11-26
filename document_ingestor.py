@@ -16,10 +16,29 @@ from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from qdrant_client.http.models import Field,Filter,FieldCondition,Match,MatchValue,MatchAny
 import pandas as pd
 from langchain_core.output_parsers import StrOutputParser
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+
 class DocumentIngestor:
 
-  load_dotenv()
-  def doc_ingestion_setup(self):
+ ALL_COLLECTIONS = ["general", "contracts", "litigation", "compliance", "ip"]
+
+ ROLE_COLLECTIONS: dict[str, list[str]] = {
+    "corporate_counsel": ["contracts", "ip", "general"],
+    "litigation_counsel": ["litigation", "ip", "general"],
+    "compliance_officer": ["compliance", "general"],
+    "paralegal": ["contracts", "general"],
+    "general_counsel": ALL_COLLECTIONS,
+ }
+ CROSS_ENCODER_MODEL="cross-encoder/ms-marco-MiniLM-L-6-v2"
+ EMBED_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+ collection_name="veridian_legal"
+ SPARSE_VECTOR_NAME="veridian_legal_sparse"
+ DOC_PATH="./veridian_legal_dataset/"
+
+ load_dotenv()
+ def doc_ingestion_setup(self):
     
     self.customized_chunk_texts:list[Document]=[]
     self.pdfpipelines=PdfPipelineOptions(allow_external_plugins=True,heading_hierarchy_options=HeadingHierarchyOptions(enabled=True))
@@ -29,22 +48,28 @@ class DocumentIngestor:
       
 
 
-  def __init__(self):
-   self.EMBED_MODEL="sentence-transformers/all-MiniLM-L6-v2"
-   self.collection_name="veridian_legal"
-   self.SPARSE_VECTOR_NAME="veridian_legal_sparse"
-   self.DOC_PATH="./veridian_legal_dataset/"
+ def __init__(self):
+  
    self.client=QdrantClient(path="/local/vectorDb")
    self.dense_embedder=HuggingFaceEmbeddings(model_name = self.EMBED_MODEL,
              model_kwargs = {"device": "cuda"},
              encode_kwargs = {"normalize_embeddings": True})
    self.sparse_embedder=FastEmbedSparse(model_name="Qdrant/bm25",batch_size=32)
-   self.vector_store:QdrantVectorStore=QdrantVectorStore(client=self.client,collection_name=self.collection_name,embedding=self.dense_embedder,
-                                        sparse_embedding=self.sparse_embedder,retrieval_mode=RetrievalMode.HYBRID,sparse_vector_name=self.SPARSE_VECTOR_NAME)
+   self.vector_store:QdrantVectorStore=None
          
-      
+ def _get_vector_store(self) -> QdrantVectorStore:
+    if self.vector_store is None:
+       self.vector_store = QdrantVectorStore(
+            client=self.client,
+            collection_name=self.collection_name,
+            embedding=self.dense_embedder,
+            sparse_embedding=self.sparse_embedder,
+            retrieval_mode=RetrievalMode.HYBRID,
+            sparse_vector_name=self.SPARSE_VECTOR_NAME,
+        )
+    return self.vector_store   
 
-  def get_chunk_type(self,doc_items) -> str:
+ def get_chunk_type(self,doc_items) -> str:
     labels= {str(item["label"]).lower() for item in doc_items}
     if "table" in labels:
      return "table" 
@@ -56,7 +81,7 @@ class DocumentIngestor:
     return "text"
   
   
-  def read_legal_dataset(self,data:Series,filepath:str):
+ def read_legal_dataset(self,data:Series,filepath:str):
     
       if filepath.lower().endswith(".pdf"):
        chunked_docs=DoclingLoader(file_path=filepath,converter=self.pdf_converter,chunker=self.chunker).load()
@@ -80,7 +105,7 @@ class DocumentIngestor:
                                                           "chunk_type":self.get_chunk_type(doc.metadata["dl_meta"]["doc_items"])}))
         
 
-  def create_embedding(self,customized_chunk_texts):
+ def create_embedding(self,customized_chunk_texts):
   
    if self.client.collection_exists(collection_name=self.collection_name):
      self.client.delete_collection(collection_name=self.collection_name)
@@ -90,22 +115,25 @@ class DocumentIngestor:
                               vectors_config=VectorParams(distance=Distance.COSINE,size=len(self.dense_embedder.embed_query("test"))))
    for field in ["metadata.collection","metadata.matter_id","metadata.access_roles"]:
     self.client.create_payload_index(collection_name=self.collection_name,field_name=field,field_schema="keyword")
-   ids=self.vector_store.add_documents(customized_chunk_texts)
+   ids=self._get_vector_store().add_documents(customized_chunk_texts)
    print(f"Upsert Done {len(ids)}")
 
-  def hybrid_search(self,user_name:str,seach_query:str):
+ def hybrid_search(self,user_name:str,search_query:str):
     df=pd.read_json(self.DOC_PATH+"users_seed.json")
     for _,item in df.iterrows():
       if item["username"]==user_name:
         current_user_roles=[item["role"]]
         current_user_matter=item["matters"]
+        current_user_collection_access:list[str]=self.ROLE_COLLECTIONS.get(item["role"],[])
         conditions = [
             FieldCondition(
                 key="metadata.access_roles",
                 match=MatchAny(any=current_user_roles)
-            )
+            ),
+            FieldCondition(key="metadata.collection",
+                match=MatchAny(any=current_user_collection_access))
         ]
-
+ 
         if "*" not in current_user_matter:
             conditions.append(
                 FieldCondition(
@@ -114,11 +142,14 @@ class DocumentIngestor:
                 )
             )
         qdrant_filter = Filter(must=conditions)
-        retrievar=self.vector_store.as_retriever(search_kwargs={"k":10,"filter":qdrant_filter})
-        results=retrievar.invoke(seach_query)
+        broad_retrievar=self._get_vector_store().as_retriever(search_kwargs={"k":10,"filter":qdrant_filter})
+        cross_encoder = HuggingFaceCrossEncoder(model_name=self.CROSS_ENCODER_MODEL,model_kwargs={"device":"cuda"})
+        re_ranker = CrossEncoderReranker(model=cross_encoder,top_n=3)
+        re_ranking_retrievar=ContextualCompressionRetriever(compressor=re_ranker,base_retriever=broad_retrievar)
+        results=re_ranking_retrievar.invoke(search_query)
         print(results)
 
-  def ingest_legal_docs(self):  
+ def ingest_legal_docs(self):  
     try:
         self.doc_ingestion_setup()
         manifest=pd.read_json(self.DOC_PATH+"manifest.json")
@@ -128,6 +159,6 @@ class DocumentIngestor:
         self.create_embedding(self.customized_chunk_texts)
     except Exception as e:
         print("Error occurred during document ingestion",e)
-    finally:
-        self.client.close()
+    # finally:
+        # self.client.close()
 
